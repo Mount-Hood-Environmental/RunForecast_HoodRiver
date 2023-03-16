@@ -1,0 +1,772 @@
+---
+title: "Hood River Spring Chinook and Steelhead Forecasting Models"
+author: "Mark Roes"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, results = "hide", message = FALSE, warning = FALSE)
+options(scipen = 999)
+source('R/package_load.r')
+
+package_load(package_list = c("plyr","tidyverse", "janitor", "lubridate", "dataRetrieval", "brms", "readxl", "here", "kableExtra"))
+set.seed(1571)
+```
+
+```{r load-data}
+load(file = "R/prediction_year.rda")
+
+ad_count = read_excel('data input/Abundance/AbundanceData.xlsx',
+                       sheet = 'Adult') %>%
+  janitor::clean_names()
+
+smolt_count = read_excel('data input/Abundance/AbundanceData.xlsx',
+                          sheet = 'Smolt') %>%
+   janitor::clean_names()
+
+npgo = read_csv('data input/Environmental/NPGO.csv') %>%
+  janitor::clean_names() %>%
+  bind_rows(tibble(year = prediction_year))
+
+#Load in Tucker bridge gage flow
+
+tucker_flow = readNWISdv("14120000", "00060", "1987-01-01", Sys.Date()) %>%
+  dplyr::select(Date, X_00060_00003) %>%
+  dplyr::rename(cfs_daily = X_00060_00003) %>%
+  janitor::clean_names() %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  group_by(year) %>%
+  dplyr::summarise(min_flow_yr = min(cfs_daily)) %>%
+  ungroup()
+
+#load bonneville metrics
+# bon = read_csv("data input/Environmental/Bonneville_data.csv") %>%
+#   janitor::clean_names() %>%
+#   mutate(month = month(date),
+#          year = year(date),
+#          jday = yday(date),
+#          wsthd_return = ifelse(month %in% c(12,1,2,3,4), "yes","no" ),
+#          wsthd_out = ifelse(month %in% c(5), 'yes','no' ),
+#          hsc_out = ifelse(month %in% c(4,5),'yes','no'))
+```
+
+```{r wst-dat}
+#data
+# bon_wst_env = bon %>%
+#   filter(wsthd_out == 'yes') %>%
+#   group_by(year) %>%
+#   dplyr::summarise(mean_spill = mean(spill_kcfs, na.rm = T),
+#                    temp_out = mean(temperature_c, na.rm = T)) %>%
+#   ungroup() %>%
+#   left_join(bon %>%
+#               filter(wsthd_return == "yes") %>%
+#               group_by(year) %>%
+#               dplyr::summarise(temp_in = mean(temperature_c, na.rm = T)) %>%
+#               ungroup())
+
+
+wst_env_dat = npgo %>%
+              filter(month == 5 | is.na(month)) %>%
+  left_join(tucker_flow)
+
+wst_ages = read_excel('data input/Abundance/AgeData.xlsx',
+                      sheet = 'NOR WSTHD scales') %>%
+  janitor::clean_names() %>%
+  pivot_longer(2:last_col(1)) %>%
+  dplyr::mutate(fresh = substr(name,2,2),
+                salt = substr(name,4,4))
+
+wst_props = bind_rows(wst_ages %>%
+                        dplyr::mutate(age = as.numeric(fresh) + as.numeric(salt)) %>%
+                        group_by(age, year) %>%
+                        dplyr::summarise(prop_yr = age/total) %>%
+                        ungroup() %>%
+                        group_by(age) %>%
+                        dplyr::summarise(prop = mean(prop_yr)) %>%
+                        ungroup() %>%
+                        dplyr::mutate(type = 'age',
+                                      class = as.factor(age)) %>%
+                        dplyr::select(type, class, prop),
+                        # age_summary %>%
+                        # #proportions by age
+                        # filter(run == "WSTHD") %>%
+                        # pivot_longer(cols = names(.)[-c(1,2,9)]) %>%
+                        # dplyr::mutate(type = 'age',
+                        #               class = substr(name,5,5),
+                        #               prop_yr = value/total) %>%
+                        # group_by(type, class) %>%
+                        # dplyr::summarise(prop = mean(prop_yr)) %>%
+                        # ungroup(),
+                      #proportions by fresh
+                      wst_ages %>%
+                        group_by(year, total, fresh) %>%
+                        dplyr::summarise(prop_fresh_yr = sum(value)/total) %>%
+                        ungroup() %>%
+                        distinct() %>%
+                        group_by(fresh) %>%
+                        dplyr::summarise(prop = mean(prop_fresh_yr)) %>%
+                        ungroup() %>%
+                        mutate(type = 'fresh') %>%
+                        rename(class = fresh),
+                      #proportions by salt
+                      wst_ages %>%
+                        group_by(year, total, salt) %>%
+                        dplyr::summarise(prop_salt_yr = sum(value)/total) %>%
+                        ungroup() %>%
+                        distinct() %>%
+                        group_by(salt) %>%
+                        dplyr::summarise(prop = mean(prop_salt_yr)) %>%
+                        ungroup() %>%
+                        mutate(type = 'salt') %>%
+                        rename(class = salt)
+)
+
+wst_dat = wst_env_dat %>%
+  dplyr::select(-month) %>%
+  left_join(smolt_count %>%
+  dplyr::select(year, nor_sthd)) %>%
+  left_join(ad_count %>%
+  dplyr::select(year, nor_wsthd_returns, wsthd_total_escapement)) %>%
+  #adjust covs to years
+  mutate(esc_adj = ifelse(is.na(lag(wsthd_total_escapement,2)), lag(wsthd_total_escapement,3) * filter(wst_props, type == 'age' & class == 2)$prop,
+                          lag(wsthd_total_escapement,2)*filter(wst_props, type == 'age' & class == 2)$prop) +
+           lag(wsthd_total_escapement,3) * filter(wst_props, type == 'age' & class == 3)$prop+
+           lag(wsthd_total_escapement,4) * filter(wst_props, type == 'age' & class == 4)$prop+
+           lag(wsthd_total_escapement,5) * filter(wst_props, type == 'age' & class == 5)$prop+
+           ifelse(is.na(lag(wsthd_total_escapement,6)), lag(wsthd_total_escapement,5) * filter(wst_props, type == 'age' & class == 6)$prop,
+                  lag(wsthd_total_escapement, 6) * filter(wst_props, type == 'age' & class == 6)$prop),
+         smolt_adj = ifelse(is.na(lag(nor_sthd,1)),
+                            lag(nor_sthd,2) * filter(wst_props, type == 'salt' & class == 1)$prop,
+                            lag(nor_sthd,1) * filter(wst_props, type == 'salt' & class == 1)$prop)+
+           lag(nor_sthd,2) * filter(wst_props, type == 'salt' & class == 2)$prop+
+           lag(nor_sthd,3) * filter(wst_props, type == 'salt' & class == 3)$prop,
+         # spill_adj = lag(mean_spill, 1) * filter(wst_props, type == 'salt' & class == 1)$prop+
+         #   lag(mean_spill, 2) * filter(wst_props, type == 'salt' & class == 2)$prop+
+         #   lag(mean_spill, 3) * filter(wst_props, type == 'salt' & class == 3)$prop+
+         #   lag(mean_spill, 4) * filter(wst_props, type == 'salt' & class == 4)$prop,
+         min_flow_adj = lag(min_flow_yr, 2) * filter(wst_props, type == 'age' & class == 2)$prop+
+           lag(min_flow_yr, 3) * filter(wst_props, type == 'age' & class == 3)$prop+
+           lag(min_flow_yr, 4) * filter(wst_props, type == 'age' & class == 4)$prop+
+           lag(min_flow_yr, 5) * filter(wst_props, type == 'age' & class == 5)$prop+
+           ifelse(is.na(lag(min_flow_yr,6)), lag(min_flow_yr,5) * filter(wst_props, type == 'age' & class == 6)$prop,
+                  lag(min_flow_yr, 6) * filter(wst_props, type == 'age' & class == 6)$prop),
+         # temp_out_adj = lag(temp_out, 1) * filter(wst_props, type == 'salt' & class == 1)$prop+
+         #   lag(temp_out, 2) * filter(wst_props, type == 'salt' & class == 2)$prop+
+         #   lag(temp_out, 3) * filter(wst_props, type == 'salt' & class == 3)$prop+
+         #   lag(temp_out, 4) * filter(wst_props, type == 'salt' & class == 4)$prop,
+         npgo_adj = lag(npgo, 1) * filter(wst_props, type == 'salt' & class == 1)$prop+
+           lag(npgo, 2) * filter(wst_props, type == 'salt' & class == 2)$prop+
+           lag(npgo, 3) * filter(wst_props, type == 'salt' & class == 3)$prop+
+           lag(npgo, 4) * filter(wst_props, type == 'salt' & class == 4)$prop) %>%
+  mutate(esc_std = (esc_adj - mean(esc_adj, na.rm = T))/sd(esc_adj, na.rm = T),
+         # spill_std = (spill_adj - mean(spill_adj, na.rm = T))/sd(spill_adj, na.rm = T),
+         min_flow_std = (min_flow_adj - mean(min_flow_adj, na.rm = T))/sd(min_flow_adj, na.rm = T),
+         npgo_std = (npgo_adj - mean(npgo_adj, na.rm = T))/sd(npgo_adj, na.rm = T),
+         # temp_in_std = (temp_in - mean(temp_in, na.rm = T))/sd(temp_in, na.rm = T),
+         # temp_out_std = (temp_out_adj - mean(temp_out_adj, na.rm = T))/sd(temp_out_adj, na.rm = T),
+         esc_smoltmod_adj = ifelse(is.na(lag(wsthd_total_escapement, 1)), lag(wsthd_total_escapement,2) * filter(wst_props, type == 'fresh' & class == 1)$prop,
+                                   lag(wsthd_total_escapement, 2)*filter(wst_props, type == 'fresh' & class == 1)$prop)+
+           lag(wsthd_total_escapement, 3) * filter(wst_props, type == 'fresh' & class == 2)$prop+
+           lag(wsthd_total_escapement, 4) * filter(wst_props, type == 'fresh' & class == 3)$prop+
+           lag(wsthd_total_escapement, 5) * filter(wst_props, type == 'fresh' & class == 4)$prop,
+         min_flow_smoltmod_adj = lag(min_flow_yr,1) * filter(wst_props, type == 'fresh' & class == 2)$prop+
+           lag(min_flow_yr,2) * filter(wst_props, type == 'fresh' & class == 3)$prop+
+           lag(min_flow_yr,3) * filter(wst_props, type == 'fresh' & class == 4)$prop
+  )
+
+```
+
+```{r NOR-wsthd-smolt-impute}
+if(!file.exists(paste0(here::here(),"/Model objects/nor_wsthd_smoltmod.rda"))){
+#Impute smolt abundance for 2021, 2022
+mod_wst_smolt = brm(nor_sthd ~ 0 + esc_smoltmod_adj + min_flow_smoltmod_adj, data = wst_dat)
+
+save(mod_wst_smolt, file = paste0(here::here(),"/Model objects/nor_wsthd_smoltmod.rda"))
+}else{load(paste0(here::here(),"/Model objects/nor_wsthd_smoltmod.rda"))
+  }
+```
+
+```{r NOR-wsthd}
+if(!file.exists(paste0(here::here(),"/Model objects/nor_wsthd_mod.rda"))){
+#run model
+mod_wst = brm(nor_wsthd_returns ~ 0 + smolt_adj + min_flow_adj  +  npgo_adj, data = wst_dat)
+
+save(mod_wst, file = paste0(here::here(),"/Model objects/nor_wsthd_mod.rda"))
+}else{load(paste0(here::here(),"/Model objects/nor_wsthd_mod.rda")) 
+  
+}
+wst_pred = posterior_predict(mod_wst, filter(wst_dat, year == prediction_year))
+wst_int = predictive_interval(wst_pred)
+```
+
+```{r HOR-wsthd}
+hwst_props = read_excel('data input/Abundance/AgeData.xlsx',
+                        sheet = 'HOR WSTHD') %>%
+  janitor::clean_names() %>%
+  pivot_longer(2:last_col(1)) %>%
+  dplyr::mutate(salt = substr(name,2,2)) %>%
+  group_by(salt) %>%
+  dplyr::summarise(prop =  sum(value)/sum(total)) %>%
+  ungroup() #%>%
+  # mutate(type = 'salt') %>%
+  # rename(class = salt)
+
+hwst_dat = npgo %>%
+  filter(month == 5 | is.na(month)) %>%
+  left_join(smolt_count %>%
+  dplyr::select(year, hor_wsthd) %>%
+  dplyr::rename(hor_smolt = hor_wsthd)) %>%
+  left_join(ad_count %>%
+              dplyr::select(year, hor_wsthd)) %>%
+  mutate(smolt_adj = lag(hor_smolt, 1) * filter(hwst_props, salt == '1')$prop +
+           lag(hor_smolt, 2) * filter(hwst_props, salt == '2')$prop+
+           lag(hor_smolt, 3) * filter(hwst_props, salt == '3')$prop+
+           lag(hor_smolt, 4) * filter(hwst_props, salt == '4')$prop,
+         npgo_adj = lag(npgo, 1) * filter(hwst_props, salt == '1')$prop +
+           lag(npgo, 2) * filter(hwst_props, salt == '2')$prop +
+           lag(npgo, 3) * filter(hwst_props, salt == '3')$prop
+  )
+if(!file.exists(paste0(here::here(),"/Model objects/hor_wsthd_mod.rda"))){
+#Model
+mod_hwst = brm(hor_wsthd ~ 0 + smolt_adj + npgo_adj, data = hwst_dat)
+
+save(mod_hwst, file = paste0(here::here(),"/Model objects/hor_wsthd_mod.rda"))
+}else{load(paste0(here::here(),"/Model objects/hor_wsthd_mod.rda"))
+}
+
+hwst_pred = posterior_predict(mod_hwst, filter(hwst_dat, year == prediction_year))
+hwst_int = predictive_interval(hwst_pred)
+```
+
+```{r SSTHD}
+sst_props = read_excel('data input/Abundance/AgeData.xlsx',
+                       sheet = 'NOR SSTHD') %>%
+  janitor::clean_names() %>%
+  pivot_longer(2:last_col(1)) %>%
+  dplyr::mutate(salt = substr(name,2,2)) %>%
+  group_by(salt) %>%
+  dplyr::summarise(prop =  sum(value)/sum(total)) %>%
+  ungroup() %>%
+  mutate(type = 'salt') %>%
+  rename(class = salt)
+  
+
+
+sst_dat = npgo %>%
+  filter(month == 5 | is.na(month)) %>%
+  left_join(tucker_flow) %>%
+  left_join(ad_count %>% 
+              dplyr::select(year, ssthd, ssthd_bon, ssthd_dalles)) %>%
+  left_join(smolt_count %>%
+              dplyr::select(year, nor_sthd)) %>%
+  mutate(damcount = ssthd_bon - ssthd_dalles,
+         damcount_adj = lag(damcount,1),
+         smolt_adj = lag(nor_sthd, 1) * filter(sst_props, class == 1)$prop+
+           lag(nor_sthd, 2) * filter(sst_props, class == 2)$prop+
+           lag(nor_sthd, 3) * filter(sst_props, class == 3)$prop,
+         npgo_adj = lag(npgo,1) * filter(sst_props, class == 1)$prop+
+           lag(npgo, 2) * filter(sst_props, class == 2)$prop+
+           lag(npgo, 3) * filter(sst_props, class == 3)$prop,
+         min_flow_adj = lag(min_flow_yr,2) * filter(sst_props, class == 1)$prop+
+           lag(min_flow_yr,3) * filter(sst_props, class == 2)$prop+
+           lag(min_flow_yr,4) * filter(sst_props, class == 3)$prop)
+  
+
+if(!file.exists(paste0(here::here(),"/Model objects/ssthd_mod.rda"))){
+#run model
+mod_sst = brm(ssthd ~ 0 + damcount_adj + npgo_adj + min_flow_adj, data = sst_dat)
+
+save(mod_sst, file = paste0(here::here(),"/Model objects/ssthd_mod.rda"))
+}else{load(paste0(here::here(),"/Model objects/ssthd_mod.rda"))
+}
+#predictions
+sst_pred = posterior_predict(mod_sst, filter(sst_dat, year == prediction_year))
+sst_int = predictive_interval(sst_pred)
+```
+
+```{r HOR-spch}
+hsc_ages = read_excel('data input/Abundance/AgeData.xlsx',
+                      sheet = 'HOR SPCH') %>%
+  janitor::clean_names() %>%
+  pivot_longer(2:last_col(1)) %>%
+  dplyr::mutate(salt = substr(name,2,2),
+                salt_prop = value/total)
+
+hsc_props = left_join(hsc_ages %>% group_by(salt) %>%
+                        dplyr::summarise(prop_yr = mean(salt_prop)) %>%
+                        ungroup(),
+                      hsc_ages %>% group_by(salt) %>%
+                        dplyr::summarise(prop_tot = sum(value)/sum(total)) %>%
+                        ungroup()
+                      
+)
+
+#Get data together
+#abundance
+hsc_count = ad_count %>%
+  dplyr::select(year, hor_spch, hor_spch_jack) %>%
+  left_join(smolt_count %>%
+              rename(hor_spch_smolt = hor_spch) %>%
+              dplyr::select(year, hor_spch_smolt))
+
+#env
+hsc_env =  npgo %>% 
+  filter(month == 5 | is.na(month)) %>%
+  dplyr::select(year,npgo)
+  # left_join(bon %>%
+  # filter(hsc_out == 'yes') %>%
+  # group_by(year) %>%
+  # dplyr::summarise(mean_spill = mean(spill_kcfs, na.rm = T),
+  #                  temp_out = mean(temperature_c, na.rm = T)) %>%
+  # ungroup())
+
+#join together, offset by ages (for both adult and jack model)
+hsc_dat = hsc_env %>%
+  left_join(hsc_count) %>%
+  mutate(smolt_jack_adj = lag(hor_spch_smolt,3),
+         smolt_ad_adj_tot = lag(hor_spch_smolt,4)*filter(hsc_props, salt == 3)$prop_tot +
+           lag(hor_spch_smolt,5)*filter(hsc_props,salt==3)$prop_tot,
+         npgo_jack_adj = lag(npgo,1),
+         npgo_ad_adj_tot = lag(npgo,2)*filter(hsc_props, salt == 2)$prop_tot +
+           lag(npgo,3)*filter(hsc_props,salt == 3)$prop_tot,
+         # spill_jack_adj = lag(mean_spill, 1),
+         # spill_ad_adj_tot = lag(mean_spill,2)*filter(hsc_props, salt == 2)$prop_tot +
+         #   lag(mean_spill,3)*filter(hsc_props,salt == 3)$prop_tot,
+         prior_jack_adj_tot = lag(smolt_jack_adj,1)*filter(hsc_props, salt == 2)$prop_tot+
+           lag(smolt_jack_adj,2)*filter(hsc_props, salt == 3)$prop_tot,
+         prior_returns_adj_tot = lag(smolt_jack_adj,1)*filter(hsc_props, salt == 2)$prop_tot+
+           lag(smolt_jack_adj,2)*filter(hsc_props, salt == 3)$prop_tot+
+           lag(hor_spch,1)*filter(hsc_props,salt == 3)$prop_tot
+  )
+if(!file.exists(paste0(here::here(),"/Model objects/hor_spch_mods.rda"))){
+#run model
+#adults
+mod_hsc_ad = brm(hor_spch ~ 0 + smolt_ad_adj_tot + npgo_ad_adj_tot, data = hsc_dat)
+
+
+#jacks
+mod_hsc_jack = brm(hor_spch_jack ~ 0 + smolt_jack_adj + npgo_jack_adj, data = hsc_dat)
+# hsc_jack_lm = lm(hor_spch_jack ~ 0 + smolt_jack_adj + npgo_jack_adj, data = hsc_dat)
+save(mod_hsc_ad, mod_hsc_jack, file = paste0(here::here(),"/Model objects/hor_spch_mods.rda"))
+}else{load(paste0(here::here(),"/Model objects/hor_spch_mods.rda"))
+}
+
+hsc_ad_pred = posterior_predict(mod_hsc_ad, filter(hsc_dat, year == prediction_year))
+hsc_ad_int = predictive_interval(hsc_ad_pred)
+
+hsc_jack_pred = posterior_predict(mod_hsc_jack, filter(hsc_dat, year == prediction_year))
+hsc_jack_int = predictive_interval(hsc_jack_pred)
+
+```
+
+```{r NOR-spch}
+nsc_dat = npgo %>%
+  filter(month == 9 | is.na(month)) %>%
+  left_join(tucker_flow) %>%
+  left_join(ad_count %>%
+  dplyr::select(year, nor_spch, nor_spch_jack, spch_bon, spch_dalles)) %>%
+  mutate(spch_damcount = spch_bon - spch_dalles,
+         spch_dam_adj = lag(spch_damcount, 4) * filter(hsc_props, salt == 2)$prop_tot+
+           lag(spch_damcount, 5) * filter(hsc_props, salt == 3)$prop_tot,
+         jack_count_adj = lag(nor_spch_jack,1) * filter(hsc_props, salt == 2)$prop_tot+
+           lag(nor_spch_jack, 2) * filter(hsc_props, salt == 3)$prop_tot,
+         min_flow_adj = lag(min_flow_yr, 3) * filter(hsc_props, salt == 2)$prop_tot+
+           lag(min_flow_yr, 4) * filter(hsc_props, salt == 3)$prop_tot,
+         npgo_adj = lag(npgo, 2) * filter(hsc_props, salt == 2)$prop_tot+
+           lag(npgo, 3) * filter(hsc_props, salt == 3)$prop_tot,
+         spch_dam_jack_adj = lag(spch_damcount, 3),
+         min_flow_jack_adj = lag(min_flow_yr, 2),
+         npgo_jack_adj = lag(npgo, 1)
+         )
+
+if(!file.exists(paste0(here::here(),"/Model objects/nor_spch_mods.rda"))){
+#run models
+
+mod_nsc_ad = brm(nor_spch ~ 0 + spch_dam_adj + min_flow_adj, data = nsc_dat)
+
+mod_nsc_jack = brm(nor_spch_jack ~ 0 + spch_dam_jack_adj + npgo_jack_adj, data = nsc_dat)
+
+save(mod_nsc_ad, mod_nsc_jack, file = paste0(here::here(),"/Model objects/nor_spch_mods.rda"))
+}else{load(paste0(here::here(),"/Model objects/nor_spch_mods.rda"))
+}
+
+nsc_ad_pred = posterior_predict(mod_nsc_ad, filter(nsc_dat, year == prediction_year))
+nsc_ad_int = predictive_interval(nsc_ad_pred)
+
+nsc_jack_pred = posterior_predict(mod_nsc_jack, filter(nsc_dat, year == prediction_year))
+nsc_jack_int = predictive_interval(nsc_jack_pred)
+```
+
+
+## Forecasts
+
+Below are the forecasts for `r prettyNum(prediction_year)`  
+```{r forecast-results-table, results = "hold"}
+
+tibble(run = c("NOR winter steelhead", "HOR winter steelhead", "NOR summer steelhead", "NOR spring Chinook adults", "NOR spring Chinook jacks", "HOR spring Chinook adults", "HOR spring Chinook jacks"),
+                      estimate = c(median(wst_pred), median(hwst_pred), median(sst_pred) ,median(nsc_ad_pred), median(nsc_jack_pred), median(hsc_ad_pred), median(hsc_jack_pred)),
+                      ci_lower = c(wst_int[1], hwst_int[1], sst_int[1], nsc_ad_int[1], nsc_jack_int[1], hsc_ad_int[1], hsc_jack_int[1]),
+                      ci_upper = c(wst_int[2], hwst_int[2], sst_int[2], nsc_ad_int[2], nsc_jack_int[2], hsc_ad_int[2], hsc_jack_int[2])) %>%
+  mutate(ci_lower = ifelse(ci_lower < 0, 0, ci_lower),
+         estimate = ifelse(estimate < 0, 0, estimate)) %>%
+  kable(booktabs = T,
+        digits = 0,
+        align = "lccc",
+        format.args = list(big.mark = ","),
+        col.names = c("Run", "Prediction", "90% PI, lower", "90% PI, upper")) %>%
+  kable_styling(full_width = F,
+                position = "center",
+                bootstrap_options = c("striped", "condensed"))
+
+```
+
+## Model Information  
+
+### NOR Winter Steelhead  
+```{r NOR-wsthd-results, results = "hold"}
+summary(mod_wst)
+
+#Obs v pred
+fit_pred = posterior_epred(mod_wst, filter(wst_dat, !is.na(nor_wsthd_returns) & !is.na(smolt_adj)))
+
+obs_pred = tibble(year = filter(wst_dat, !is.na(nor_wsthd_returns) & !is.na(smolt_adj))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(wst_dat %>% dplyr::select(year, nor_wsthd_returns)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','nor_wsthd_returns')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/NOR_wsthd_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+```
+
+#### Winter Steelhead Smolt Imputation for 2021, 2022  
+```{r NOR-wsthd-smolt-results, results = "hold"}
+
+summary(mod_wst_smolt)
+smolt_pred = posterior_predict(mod_wst_smolt, filter(wst_dat, year %in% c(2021,2022)))
+
+#Imputation predictions
+smolt_med = apply(smolt_pred,2,median)
+smolt_int = predictive_interval(smolt_pred)
+
+print(paste0("Smolt prediction for 2021: ", round(smolt_med[1],0), "; 2022: ", round(smolt_med[2],0)))
+#Obs v pred
+fit_pred = posterior_epred(mod_wst_smolt, filter(wst_dat, !is.na(nor_sthd) & !is.na(esc_smoltmod_adj) & year < 2021))
+
+obs_pred = tibble(year = filter(wst_dat, !is.na(nor_sthd) & !is.na(esc_smoltmod_adj) & year < 2021)$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(wst_dat %>% dplyr::select(year, nor_sthd)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','nor_sthd')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Smolt outmigration abundance")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/NOR_sthd_smolt_estimate_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 4,
+                       units = 'in')
+obs_pred
+dev.off()
+
+
+```
+
+### HOR Winter Steelhead  
+```{r HOR-wsthd-results, results = "hold"}
+#mod summary
+summary(mod_hwst)
+
+fit_pred = posterior_epred(mod_hwst, filter(hwst_dat, !is.na(hor_wsthd) & !is.na(smolt_adj)))
+
+obs_pred = tibble(year = filter(hwst_dat, !is.na(hor_wsthd) & !is.na(smolt_adj))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(hwst_dat %>% dplyr::select(year, hor_wsthd)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','hor_wsthd')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.13,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/HOR_wsthd_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+```
+
+### NOR Summer Steelhead  
+```{r SSTHD-results, results = "hold"}
+#summaries
+summary(mod_sst)
+
+#obs vs. pred
+fit_pred = posterior_epred(mod_sst, filter(sst_dat, !is.na(ssthd) & !is.na(damcount_adj)))
+
+obs_pred = tibble(year = filter(sst_dat, !is.na(ssthd) & !is.na(damcount_adj))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(sst_dat %>% dplyr::select(year, ssthd)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','ssthd')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
+  coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Adult Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/NOR_ssthd_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+```
+
+### NOR Spring Chinook
+
+Jack model results:
+
+```{r nsc-jack-results, results = "hold"}
+summary(mod_nsc_jack)
+
+fit_pred = posterior_epred(mod_nsc_jack, filter(nsc_dat, !is.na(spch_dam_jack_adj) & !is.na(nor_spch_jack)))
+
+obs_pred = tibble(year = filter(nsc_dat, !is.na(spch_dam_jack_adj) & !is.na(nor_spch_jack))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(nsc_dat %>% dplyr::select(year, nor_spch_jack)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025),
+         med = ifelse(med <0, 0, med)) %>%
+  pivot_longer(cols = c('med','nor_spch_jack')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Jack Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/NOR_spch_jack_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+
+```
+
+Adult model results:
+
+```{r nsc-adult-results, results = "hold"}
+summary(mod_nsc_ad)
+
+fit_pred = posterior_epred(mod_nsc_ad, filter(nsc_dat, !is.na(spch_dam_adj) & !is.na(nor_spch)))
+
+obs_pred = tibble(year = filter(nsc_dat,!is.na(spch_dam_adj) & !is.na(nor_spch))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(nsc_dat %>% dplyr::select(year, nor_spch)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','nor_spch')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Adult Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/NOR_spch_adult_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+```
+
+### HOR Spring Chinook
+
+Jack model results:
+
+```{r HOR-spch-jack-results, results = "hold"}
+summary(mod_hsc_jack)
+
+fit_pred = posterior_epred(mod_hsc_jack, filter(hsc_dat, !is.na(smolt_jack_adj) & !is.na(hor_spch_jack)))
+
+obs_pred = tibble(year = filter(hsc_dat, !is.na(smolt_jack_adj) & !is.na(hor_spch_jack))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(hsc_dat %>% dplyr::select(year, hor_spch_jack)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','hor_spch_jack')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Jack Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/HOR_spch_jack_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+```
+
+Adult model results:
+
+```{r HOR-spch-ad-results, results = "hold"}
+summary(mod_hsc_ad)
+
+fit_pred = posterior_epred(mod_hsc_ad, filter(hsc_dat, !is.na(smolt_ad_adj_tot) & !is.na(hor_spch)))
+
+obs_pred = tibble(year = filter(hsc_dat, !is.na(smolt_ad_adj_tot) & !is.na(hor_spch))$year,
+            med = apply(fit_pred,2, median),
+             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
+            ) %>%
+  left_join(hsc_dat %>% dplyr::select(year, hor_spch)) %>%
+  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
+  pivot_longer(cols = c('med','hor_spch')) %>%
+  ggplot()+
+  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
+  geom_point(aes(x = year, y = value, color = name))+
+  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
+  #coord_cartesian(ylim = c(0,770))+
+  theme_bw()+
+  theme(legend.position = c(.1,.88),
+        legend.title = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(color = 'black'),
+        text = element_text(family = 'serif')
+        )+
+  labs(y = "Adult Returns")
+obs_pred
+
+tiff(filename = paste0(here(),"/report output/figures/HOR_spch_adult_ObsPred.tiff"),
+                       res = 300,
+                       compression = 'lzw',
+                       width = 6.5,
+                       height = 3.5,
+                       units = 'in')
+obs_pred
+dev.off()
+
+```
