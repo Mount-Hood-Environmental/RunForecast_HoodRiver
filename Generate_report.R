@@ -3,5 +3,6 @@
 #Prepared for: Confederated Tribes of Warm Springs
 
 #To run, simply update the "prediction_year" to the appropriate year, then highlight the lines below and click run.
+prediction_year = 2023
 source("R/generate_forecast_report.r")
-generate_forecast_report(prediction_year = 2023)
+generate_forecast_report(prediction_year = prediction_year)

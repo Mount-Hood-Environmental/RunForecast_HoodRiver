@@ -42,33 +42,9 @@ tucker_flow = readNWISdv("14120000", "00060", "1987-01-01", Sys.Date()) %>%
   group_by(year) %>%
   dplyr::summarise(min_flow_yr = min(cfs_daily)) %>%
   ungroup()
-
-#load bonneville metrics
-# bon = read_csv("data input/Environmental/Bonneville_data.csv") %>%
-#   janitor::clean_names() %>%
-#   mutate(month = month(date),
-#          year = year(date),
-#          jday = yday(date),
-#          wsthd_return = ifelse(month %in% c(12,1,2,3,4), "yes","no" ),
-#          wsthd_out = ifelse(month %in% c(5), 'yes','no' ),
-#          hsc_out = ifelse(month %in% c(4,5),'yes','no'))
 ```
 
 ```{r wst-dat}
-#data
-# bon_wst_env = bon %>%
-#   filter(wsthd_out == 'yes') %>%
-#   group_by(year) %>%
-#   dplyr::summarise(mean_spill = mean(spill_kcfs, na.rm = T),
-#                    temp_out = mean(temperature_c, na.rm = T)) %>%
-#   ungroup() %>%
-#   left_join(bon %>%
-#               filter(wsthd_return == "yes") %>%
-#               group_by(year) %>%
-#               dplyr::summarise(temp_in = mean(temperature_c, na.rm = T)) %>%
-#               ungroup())
-
-
 wst_env_dat = npgo %>%
               filter(month == 5 | is.na(month)) %>%
   left_join(tucker_flow)
@@ -130,7 +106,7 @@ wst_dat = wst_env_dat %>%
   left_join(smolt_count %>%
   dplyr::select(year, nor_sthd)) %>%
   left_join(ad_count %>%
-  dplyr::select(year, nor_wsthd_returns, wsthd_total_escapement)) %>%
+  dplyr::select(year, nor_wsthd, wsthd_total_escapement)) %>%
   #adjust covs to years
   mutate(esc_adj = ifelse(is.na(lag(wsthd_total_escapement,2)), lag(wsthd_total_escapement,3) * filter(wst_props, type == 'age' & class == 2)$prop,
                           lag(wsthd_total_escapement,2)*filter(wst_props, type == 'age' & class == 2)$prop) +
@@ -183,7 +159,7 @@ wst_dat = wst_env_dat %>%
 ```{r NOR-wsthd}
 if(!file.exists(paste0(here::here(),"/R/Model objects/",prediction_year,"/nor_wsthd_mod.rda"))){
 #run model
-mod_wst = brm(nor_wsthd_returns ~ 0 + smolt_adj + min_flow_adj  +  npgo_adj, data = wst_dat)
+mod_wst = brm(nor_wsthd ~ 0 + smolt_adj + min_flow_adj  +  npgo_adj, data = wst_dat)
 
 save(mod_wst, file = paste0(here::here(),"/R/Model objects/",prediction_year,"/nor_wsthd_mod.rda"))
 }else{load(paste0(here::here(),"/R/Model objects/",prediction_year,"/nor_wsthd_mod.rda")) 
@@ -421,16 +397,16 @@ tibble(run = c("NOR winter steelhead", "HOR winter steelhead", "NOR summer steel
 summary(mod_wst)
 
 #Obs v pred
-fit_pred = posterior_epred(mod_wst, filter(wst_dat, !is.na(nor_wsthd_returns) & !is.na(smolt_adj)))
+fit_pred = posterior_epred(mod_wst, filter(wst_dat, !is.na(nor_wsthd) & !is.na(smolt_adj)))
 
-obs_pred = tibble(year = filter(wst_dat, !is.na(nor_wsthd_returns) & !is.na(smolt_adj))$year,
+obs_pred = tibble(year = filter(wst_dat, !is.na(nor_wsthd) & !is.na(smolt_adj))$year,
             med = apply(fit_pred,2, median),
              q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
             q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
             ) %>%
-  left_join(wst_dat %>% dplyr::select(year, nor_wsthd_returns)) %>%
+  left_join(wst_dat %>% dplyr::select(year, nor_wsthd)) %>%
   mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','nor_wsthd_returns')) %>%
+  pivot_longer(cols = c('med','nor_wsthd')) %>%
   ggplot()+
   geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
   geom_point(aes(x = year, y = value, color = name))+
