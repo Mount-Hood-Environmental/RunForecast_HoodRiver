@@ -1,13 +1,16 @@
 ---
 title: "Hood River Spring Chinook and Steelhead Forecasting Models"
-author: "Mark Roes"
+author: 
+  - Mark Roes, Mount Hood Environmental. <mark.roes@mthoodenvironmental.com>
+  - Prepared for Confederated Tribes of Warm Springs
 date: "`r Sys.Date()`"
 output: word_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, results = "hide", message = FALSE, warning = FALSE, fig.height = 4, fig.width = 6.5, dpi = 300)
+knitr::opts_chunk$set(echo = FALSE, results = "hide", message = FALSE, warning = FALSE, error = FALSE, fig.height = 4, fig.width = 6.5, dpi = 300)
 options(scipen = 999)
+
 source('R/package_load.r')
 
 package_load(package_list = c("plyr","tidyverse", "janitor", "lubridate", "dataRetrieval", "brms", "readxl", "here", "flextable"))
