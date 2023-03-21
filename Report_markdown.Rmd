@@ -2,21 +2,19 @@
 title: "Hood River Spring Chinook and Steelhead Forecasting Models"
 author: "Mark Roes"
 date: "`r Sys.Date()`"
-output:
-  html_document:
-    df_print: paged
+output: word_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, results = "hide", message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(echo = FALSE, results = "hide", message = FALSE, warning = FALSE, fig.height = 4, fig.width = 6.5, dpi = 300)
 options(scipen = 999)
 source('R/package_load.r')
 
-package_load(package_list = c("plyr","tidyverse", "janitor", "lubridate", "dataRetrieval", "brms", "readxl", "here", "kableExtra"))
+package_load(package_list = c("plyr","tidyverse", "janitor", "lubridate", "dataRetrieval", "brms", "readxl", "here", "flextable"))
 set.seed(1571)
 ```
 
-```{r load-data}
+```{r load-data, results = "hold"}
 load(file = "R/prediction_year.rda")
 
 ad_count = read_excel('data input/Abundance/AbundanceData.xlsx',
@@ -28,9 +26,16 @@ smolt_count = read_excel('data input/Abundance/AbundanceData.xlsx',
    janitor::clean_names()
 
 npgo = read_csv('data input/Environmental/NPGO.csv') %>%
-  janitor::clean_names() %>%
-  bind_rows(tibble(year = prediction_year))
+  janitor::clean_names()
 
+if(!(prediction_year %in% unique(c(npgo$year, max(npgo$year+1))))){
+    print("Warning: Either the NPGO data has not been updated, or the prediction_year was not entered correctly. Results may not be valid.")
+}
+
+if(prediction_year == max(npgo$year+1)){
+  npgo = npgo %>%
+    bind_rows(tibble(year = prediction_year))
+}
 #Load in Tucker bridge gage flow
 
 tucker_flow = readNWISdv("14120000", "00060", "1987-01-01", Sys.Date()) %>%
@@ -378,311 +383,251 @@ tibble(run = c("NOR winter steelhead", "HOR winter steelhead", "NOR summer steel
                       ci_lower = c(wst_int[1], hwst_int[1], sst_int[1], nsc_ad_int[1], nsc_jack_int[1], hsc_ad_int[1], hsc_jack_int[1]),
                       ci_upper = c(wst_int[2], hwst_int[2], sst_int[2], nsc_ad_int[2], nsc_jack_int[2], hsc_ad_int[2], hsc_jack_int[2])) %>%
   mutate(ci_lower = ifelse(ci_lower < 0, 0, ci_lower),
-         estimate = ifelse(estimate < 0, 0, estimate)) %>%
-  kable(booktabs = T,
-        digits = 0,
-        align = "lccc",
-        format.args = list(big.mark = ","),
-        col.names = c("Run", "Prediction", "90% PI, lower", "90% PI, upper")) %>%
-  kable_styling(full_width = F,
-                position = "center",
-                bootstrap_options = c("striped", "condensed"))
+         estimate = ifelse(estimate < 0, 0, estimate),
+         ci_upper = ifelse(ci_upper < 0, 0, ci_upper)) %>%
+  flextable() %>%
+  set_table_properties(layout = "autofit") %>%
+  set_header_labels(values = list(run = "Run",
+                                  estimate = "Prediction",
+                                  ci_lower = "90% PI, lower",
+                                  ci_upper = "90% PI, upper")) %>%
+  colformat_double(digits = 0) %>%
+  theme_vanilla()%>% 
+  align(align ='center', part = 'all') %>% 
+  align(j = 1, align ='left', part = 'all') 
+  # kable(booktabs = T,
+  #       digits = 0,
+  #       align = "lccc",
+  #       format.args = list(big.mark = ","),
+  #       col.names = c("Run", "Prediction", "90% PI, lower", "90% PI, upper")) %>%
+  # kable_styling(full_width = F,
+  #               position = "center",
+  #               bootstrap_options = c("striped", "condensed"))
 
 ```
 
-## Model Information  
+## Prediction Figures  
 
-### NOR Winter Steelhead  
-```{r NOR-wsthd-results, results = "hold"}
-summary(mod_wst)
+```{r function-for-obs_pred-plot}
+plot_obs_pred = function(mod = NULL,
+                         data = NULL,
+                         resp = NULL,
+                         predictor = NULL,
+                         prediction_year = prediction_year,
+                         ylab = NULL){
+  
+  resp = enquo(arg = resp)
+  predictor = enquo(arg = predictor)
 
-#Obs v pred
-fit_pred = posterior_epred(mod_wst, filter(wst_dat, !is.na(nor_wsthd) & !is.na(smolt_adj)))
+  fit_pred = posterior_epred(mod, filter(data,!is.na(!!predictor) &
+                                               !is.na(!!resp)))
+  
+  fit_pred_sum = tibble(year = filter(data, !is.na(!!predictor) & !is.na(!!resp))$year,
+                        med = apply(fit_pred,2,median),
+                        q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
+                        q.975 = apply(fit_pred, 2,function(x) quantile(x, 0.975)),
+                        type = "Fitted")
+  
+  out_pred = posterior_predict(mod, filter(data, !is.na(!!predictor) &
+                                               is.na(!!resp)))
 
-obs_pred = tibble(year = filter(wst_dat, !is.na(nor_wsthd) & !is.na(smolt_adj))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(wst_dat %>% dplyr::select(year, nor_wsthd)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','nor_wsthd')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
+  out_pred_sum = tibble(year = filter(data, !is.na(!!predictor) & is.na(!!resp))$year,
+                        med = apply(out_pred,2,median),
+                        q.025 = apply(out_pred, 2,function(x) quantile(x,0.025)),
+                        q.975 = apply(out_pred, 2,function(x) quantile(x, 0.975)),
+                        type = "Predicted")
+
+  obs = dplyr::select(data, year, !!resp) %>%
+    mutate(type = "Observed") %>%
+    rename(med = !!resp)
+
+  plot = bind_rows(fit_pred_sum, out_pred_sum, obs) %>%
+    drop_na(med) %>%
+    mutate(ifelse(q.025 < 0, 0, q.025)) %>%
+    ggplot()+
+    geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), alpha = .5, width = 0.75)+
+    #scale_linetype_manual(values = c("Fitted" = 'solid',"Predicted" = 'dotdash'))+
+    geom_point(aes(x = year, y = med, fill = type, shape = type, color = type), color = 'black')+
+    scale_color_manual(values = c("Fitted" = 'black',"Observed" = 'black',"Predicted" = 'red'))+
+    scale_shape_manual(values = c("Fitted" = 21,"Observed" = 21,"Predicted" = 21))+
+    scale_fill_manual(values = c("Fitted"='black',"Observed"='white',"Predicted"='red'))+
+    theme_bw()+
+    theme(legend.position = 'top',
         legend.title = element_blank(),
         panel.grid = element_blank(),
-        axis.title.x = element_blank(),
         axis.text = element_text(color = 'black'),
         text = element_text(family = 'serif')
         )+
-  labs(y = "Returns")
+    guides(linetype = 'none', color = 'none')+
+    labs(x = "Year", y = ylab)
+    
+  
+  return(plot)
+}
+
+```
+### NOR Winter Steelhead  
+```{r NOR-wsthd-results, results = "hold"}
+#Obs v pred
+obs_pred = plot_obs_pred(mod = mod_wst, data = wst_dat, resp = nor_wsthd, predictor = smolt_adj, prediction_year = prediction_year, ylab = "Returns")
+
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/NOR_wsthd_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 ```
 
 ### HOR Winter Steelhead  
 ```{r HOR-wsthd-results, results = "hold"}
-#mod summary
-summary(mod_hwst)
-
-fit_pred = posterior_epred(mod_hwst, filter(hwst_dat, !is.na(hor_wsthd) & !is.na(smolt_adj)))
-
-obs_pred = tibble(year = filter(hwst_dat, !is.na(hor_wsthd) & !is.na(smolt_adj))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(hwst_dat %>% dplyr::select(year, hor_wsthd)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','hor_wsthd')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.13,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Returns")
+obs_pred = plot_obs_pred(mod = mod_hwst, data = hwst_dat, resp = hor_wsthd, predictor = smolt_adj, prediction_year = prediction_year, ylab = "Returns")
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/HOR_wsthd_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 ```
 
 ### NOR Summer Steelhead  
 ```{r SSTHD-results, results = "hold"}
-#summaries
-summary(mod_sst)
-
 #obs vs. pred
-fit_pred = posterior_epred(mod_sst, filter(sst_dat, !is.na(ssthd) & !is.na(damcount_adj)))
-
-obs_pred = tibble(year = filter(sst_dat, !is.na(ssthd) & !is.na(damcount_adj))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(sst_dat %>% dplyr::select(year, ssthd)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','ssthd')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
-  coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Adult Returns")
+obs_pred = plot_obs_pred(mod = mod_sst, data = sst_dat, resp = ssthd, predictor = damcount_adj, prediction_year = prediction_year, ylab = "Returns")
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/NOR_ssthd_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 ```
 
 ### NOR Spring Chinook
 
-Jack model results:
+Jack model:
 
-```{r nsc-jack-results, results = "hold"}
-summary(mod_nsc_jack)
-
-fit_pred = posterior_epred(mod_nsc_jack, filter(nsc_dat, !is.na(spch_dam_jack_adj) & !is.na(nor_spch_jack)))
-
-obs_pred = tibble(year = filter(nsc_dat, !is.na(spch_dam_jack_adj) & !is.na(nor_spch_jack))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(nsc_dat %>% dplyr::select(year, nor_spch_jack)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025),
-         med = ifelse(med <0, 0, med)) %>%
-  pivot_longer(cols = c('med','nor_spch_jack')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Jack Returns")
+```{r nsc-jack-result, results = "hold"}
+#Obs v pred
+obs_pred = plot_obs_pred(mod = mod_nsc_jack, data = nsc_dat, resp = nor_spch_jack, predictor = spch_dam_jack_adj, prediction_year = prediction_year, ylab = "Jack Returns")
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/NOR_spch_jack_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 
 ```
 
-Adult model results:
+Adult model:
 
 ```{r nsc-adult-results, results = "hold"}
-summary(mod_nsc_ad)
-
-fit_pred = posterior_epred(mod_nsc_ad, filter(nsc_dat, !is.na(spch_dam_adj) & !is.na(nor_spch)))
-
-obs_pred = tibble(year = filter(nsc_dat,!is.na(spch_dam_adj) & !is.na(nor_spch))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(nsc_dat %>% dplyr::select(year, nor_spch)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','nor_spch')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('black','red'),labels = c('predicted','observed'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Adult Returns")
+#Obs v pred
+obs_pred = plot_obs_pred(mod = mod_nsc_ad, data = nsc_dat, resp = nor_spch, predictor = spch_dam_adj, prediction_year = prediction_year, ylab = "Adult Returns")
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/NOR_spch_adult_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 ```
 
 ### HOR Spring Chinook
 
-Jack model results:
+Jack model:
 
 ```{r HOR-spch-jack-results, results = "hold"}
-summary(mod_hsc_jack)
-
-fit_pred = posterior_epred(mod_hsc_jack, filter(hsc_dat, !is.na(smolt_jack_adj) & !is.na(hor_spch_jack)))
-
-obs_pred = tibble(year = filter(hsc_dat, !is.na(smolt_jack_adj) & !is.na(hor_spch_jack))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(hsc_dat %>% dplyr::select(year, hor_spch_jack)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','hor_spch_jack')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Jack Returns")
+#Obs v pred
+obs_pred = plot_obs_pred(mod = mod_hsc_jack, data = hsc_dat, resp = hor_spch_jack, predictor = smolt_jack_adj, prediction_year = prediction_year, ylab = "Jack Returns")
 obs_pred
 
 tiff(filename = paste0("report output/",prediction_year,"/figures/HOR_spch_jack_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 ```
 
-Adult model results:
+Adult model:
 
 ```{r HOR-spch-ad-results, results = "hold"}
-summary(mod_hsc_ad)
-
-fit_pred = posterior_epred(mod_hsc_ad, filter(hsc_dat, !is.na(smolt_ad_adj_tot) & !is.na(hor_spch)))
-
-obs_pred = tibble(year = filter(hsc_dat, !is.na(smolt_ad_adj_tot) & !is.na(hor_spch))$year,
-            med = apply(fit_pred,2, median),
-             q.025 = apply(fit_pred, 2,function(x) quantile(x,0.025)),
-            q.975 =apply(fit_pred, 2,function(x) quantile(x, 0.975))
-            ) %>%
-  left_join(hsc_dat %>% dplyr::select(year, hor_spch)) %>%
-  mutate(q.025 = ifelse(q.025 < 0, 0, q.025)) %>%
-  pivot_longer(cols = c('med','hor_spch')) %>%
-  ggplot()+
-  geom_errorbar(aes(x = year, ymin = q.025, ymax = q.975), color = 'grey50')+
-  geom_point(aes(x = year, y = value, color = name))+
-  scale_color_manual(values = c('red','black'),labels = c('observed','predicted'))+
-  #coord_cartesian(ylim = c(0,770))+
-  theme_bw()+
-  theme(legend.position = c(.1,.88),
-        legend.title = element_blank(),
-        panel.grid = element_blank(),
-        axis.title.x = element_blank(),
-        axis.text = element_text(color = 'black'),
-        text = element_text(family = 'serif')
-        )+
-  labs(y = "Adult Returns")
+#Obs v pred
+obs_pred = plot_obs_pred(mod = mod_hsc_ad, data = hsc_dat, resp = hor_spch, predictor = smolt_ad_adj_tot, prediction_year = prediction_year, ylab = "Adult Returns")
 obs_pred
-
 tiff(filename = paste0("report output/",prediction_year,"/figures/HOR_spch_adult_ObsPred.tiff"),
-                       res = 300,
+                       res = 1000,
                        compression = 'lzw',
                        width = 6.5,
                        height = 3.5,
                        units = 'in')
 obs_pred
-dev.off()
+x = dev.off()
 
+```
+
+## Model Information
+### NOR Winter Steelhead  
+```{r NOR-wsthd-mod-info, results = "hold"}
+summary(mod_wst)
+```
+### HOR Winter Steelhead  
+```{r HOR-wsthd-mod-info, results = "hold"}
+#mod summary
+summary(mod_hwst)
+```
+
+### NOR Summer Steelhead  
+```{r SSTHD-mod-info, results = "hold"}
+#summaries
+summary(mod_sst)
+```
+
+### NOR Spring Chinook
+
+Jack model:
+
+```{r nsc-jack-mod-info, results = "hold"}
+summary(mod_nsc_jack)
+```
+
+Adult model:
+
+```{r nsc-adult-mod-info, results = "hold"}
+summary(mod_nsc_ad)
+```
+
+### HOR Spring Chinook
+
+Jack model:
+
+```{r HOR-spch-jack-mod-info, results = "hold"}
+summary(mod_hsc_jack)
+```
+
+Adult model:
+
+```{r HOR-spch-ad-mod-info, results = "hold"}
+summary(mod_hsc_ad)
 ```

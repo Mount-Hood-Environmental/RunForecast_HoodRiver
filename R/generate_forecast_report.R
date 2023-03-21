@@ -13,5 +13,5 @@ generate_forecast_report = function(prediction_year = year(Sys.Date())){
   
   
   rmarkdown::render(input = "Report_markdown.rmd",
-                    output_file = paste0("report output/",prediction_year,"/forecast_report_",prediction_year,".html"))
+                    output_file = paste0("report output/",prediction_year,"/forecast_report_",prediction_year,".docx"))
 }
